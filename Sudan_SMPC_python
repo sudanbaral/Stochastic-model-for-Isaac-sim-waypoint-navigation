@@ -1,0 +1,207 @@
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+import numpy as np
+import math
+import matplotlib.pyplot as plt
+
+# --- EXPERIMENT CONFIGURATION ---
+# TRUE = Safety Logic (Blue). FALSE = Baseline (Red).
+ENABLE_SMPC = False
+
+class StochasticWaypointNav(Node):
+    def __init__(self):
+        super().__init__('smpc_waypoint_nav')
+        
+        # --- Communication ---
+        self.pub_cmd = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.sub_odom = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+        
+        # --- Mission: 20m x 20m Square ---
+        self.waypoints = [
+            [20.0, 0.0],   # Leg 1: East
+            [20.0, 20.0],  # Leg 2: North
+            [0.0, 20.0],   # Leg 3: West
+            [0.0, 0.0]     # Leg 4: Home
+        ]
+        self.wp_idx = 0
+        self.arrival_threshold = 1.0 
+        
+        # --- Physics & SMPC Parameters ---
+        self.dt = 0.05
+        self.lane_width = 3.0        # 3m Lane
+        self.confidence_score = 1.96 
+        
+        # State
+        self.state = np.array([0.0, 0.0, 0.0])
+        self.sigma = np.eye(3) * 0.01 
+        self.last_cmd_v = 0.0
+        self.current_slip_ratio = 0.0
+        
+        # --- Metric Recording ---
+        self.history_x = []
+        self.history_y = []
+        self.history_cte = [] 
+
+        self.timer = self.create_timer(self.dt, self.control_loop)
+        mode = "SMPC ACTIVE" if ENABLE_SMPC else "BASELINE (NO SMPC)"
+        self.get_logger().info(f"--- MISSION START: {mode} (1.5 m/s, R=0.5m) ---")
+
+    def odom_callback(self, msg):
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+        theta = math.atan2(siny_cosp, cosy_cosp)
+        
+        self.state = np.array([p.x, p.y, theta])
+        
+        v_actual = np.sqrt(msg.twist.twist.linear.x**2 + msg.twist.twist.linear.y**2)
+        if abs(self.last_cmd_v) > 0.1:
+            raw_slip = (abs(self.last_cmd_v) - v_actual) / abs(self.last_cmd_v)
+            self.current_slip_ratio = max(0.0, min(1.0, raw_slip))
+
+    def get_path_errors(self):
+        if self.wp_idx == 0: start = np.array([0.0, 0.0])
+        else: start = np.array(self.waypoints[self.wp_idx - 1])
+        target = np.array(self.waypoints[self.wp_idx])
+        
+        path_vec = target - start
+        path_len = np.linalg.norm(path_vec)
+        if path_len < 0.01: return 0.0, 0.0, 0.0
+        
+        path_unit = path_vec / path_len
+        robot_vec = self.state[0:2] - start
+        
+        cte = robot_vec[1]*path_unit[0] - robot_vec[0]*path_unit[1]
+        
+        path_angle = math.atan2(path_vec[1], path_vec[0])
+        theta_err = self.state[2] - path_angle
+        theta_err = (theta_err + np.pi) % (2 * np.pi) - np.pi
+        
+        dist = np.linalg.norm(self.state[0:2] - target)
+        return cte, theta_err, dist
+
+    def propagate_uncertainty(self):
+        v = self.last_cmd_v
+        theta = self.state[2]
+        c, s = np.cos(theta), np.sin(theta)
+        A = np.eye(3)
+        A[0, 2] = -v * s * self.dt
+        A[1, 2] =  v * c * self.dt
+        Q = np.diag([0.002, 0.002, 0.01]) * (1.0 + 3.0 * self.current_slip_ratio)
+        self.sigma = A @ self.sigma @ A.T + Q
+
+    def simulate_measurement_update(self):
+        self.sigma = self.sigma * 0.95
+        self.sigma[0,0] = max(self.sigma[0,0], 0.005)
+        self.sigma[1,1] = max(self.sigma[1,1], 0.005)
+
+    def control_loop(self):
+        self.history_x.append(self.state[0])
+        self.history_y.append(self.state[1])
+        
+        if self.wp_idx >= len(self.waypoints):
+            self.get_logger().info("Mission Complete!")
+            self.pub_cmd.publish(Twist()) 
+            raise KeyboardInterrupt 
+
+        cte, theta_err, dist = self.get_path_errors()
+        self.history_cte.append(abs(cte)) 
+        
+        if dist < self.arrival_threshold:
+            self.get_logger().info(f"Reached Waypoint {self.wp_idx+1}!")
+            self.wp_idx += 1
+            self.sigma = np.eye(3) * 0.01 
+            return
+
+        self.propagate_uncertainty()
+        self.simulate_measurement_update()
+        
+        sigma_lat = np.sqrt(self.sigma[1,1]*np.cos(self.state[2])**2 + self.sigma[0,0]*np.sin(self.state[2])**2)
+        safety_buffer = self.confidence_score * sigma_lat
+        
+        twist = Twist()
+        
+        # --- NEW PHYSICS CONFIGURATION ---
+        
+        # 1. Precision Turn Mode (Within 2.0m of corner)
+        if dist < 2.0:
+            # We want Radius = 0.5m.
+            # We set Corner Speed = 0.5 m/s.
+            # Formula: w = v / R  =>  0.5 / 0.5 = 1.0 rad/s
+            
+            v_cmd = 0.5  
+            w_limit = 1.0 
+            
+            w_raw = -0.8 * cte - 2.0 * theta_err 
+            w_cmd = max(-w_limit, min(w_limit, w_raw))
+
+        else:
+            # 2. Straight Line Mode (1.5 m/s Max)
+            if ENABLE_SMPC and (abs(cte) + safety_buffer > self.lane_width / 2.0):
+                v_cmd = 0.6 # Risk Speed (Moderate braking)
+            else:
+                # Top Speed 1.5 m/s
+                v_cmd = max(0.4, 1.5 * (1.0 - self.current_slip_ratio))
+            
+            w_cmd = -0.8 * cte - 1.5 * theta_err
+            w_cmd = max(-1.0, min(1.0, w_cmd))
+
+        twist.linear.x = float(v_cmd)
+        twist.angular.z = -float(w_cmd) 
+        
+        self.pub_cmd.publish(twist)
+        self.last_cmd_v = v_cmd
+
+def plot_results(node):
+    filename = 'path_smpc_1.5.png' if ENABLE_SMPC else 'path_baseline_1.5.png'
+    
+    errors = np.array(node.history_cte)
+    rmse = np.sqrt(np.mean(errors**2))
+    max_error = np.max(errors)
+    total_error = np.sum(errors)
+    
+    print("="*40)
+    print(f"PERFORMANCE REPORT: {'SMPC' if ENABLE_SMPC else 'BASELINE'}")
+    print("="*40)
+    print(f"RMSE (Average Drift):   {rmse:.4f} meters")
+    print(f"Max Error (Worst Case): {max_error:.4f} meters")
+    print("="*40)
+    
+    plt.figure(figsize=(10, 10))
+    path_x = [0.0] + [p[0] for p in node.waypoints]
+    path_y = [0.0] + [p[1] for p in node.waypoints]
+    plt.plot(path_x, path_y, 'g--', linewidth=2, label='Ideal Path')
+    plt.scatter(path_x, path_y, color='green', marker='x', s=100)
+    
+    color = 'blue' if ENABLE_SMPC else 'red'
+    label = f"{'SMPC' if ENABLE_SMPC else 'Baseline'} (RMSE: {rmse:.2f}m)"
+    plt.plot(node.history_x, node.history_y, color=color, linewidth=2, label=label)
+    
+    plt.title(f"Analysis (1.5 m/s, R=0.5m)\nRMSE: {rmse:.4f}m | Max: {max_error:.4f}m")
+    plt.xlabel("X (m)")
+    plt.ylabel("Y (m)")
+    plt.legend()
+    plt.grid(True)
+    plt.axis('equal')
+    
+    plt.savefig(filename)
+    print(f"Graph Saved to {filename}!")
+    plt.show()
+
+def main():
+    rclpy.init()
+    node = StochasticWaypointNav()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+        plot_results(node)
+
+if __name__ == '__main__':
+    main()
